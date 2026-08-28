@@ -323,6 +323,109 @@ def st_fdpa(
     return FdpaResult(bits, fp32_bits_to_float(bits), e_max, S, aligned)
 
 
+def st_fdpa_n(
+    a_bits: Sequence[int],
+    b_bits: Sequence[int],
+    c_bits: int,
+    sfa_bits: Sequence[int],
+    sfb_bits: Sequence[int],
+    *,
+    fmt: FpFormat = E4M3,
+    F: int = 25,
+    block: int = 32,
+    overflow_to_inf: bool = True,
+) -> FdpaResult:
+    """Generalized N-term fused scaled dot-product-accumulate: K products + c.
+
+    Identical arithmetic to st_fdpa -- one global alignment to e_max, per-term
+    truncation to F fractional bits, exact integer sum, a single RZ-FP32
+    conversion -- but the fused summation spans K products, and each
+    `block`-element chunk of the K elements carries its own E8M0 scale pair
+    (MX semantics). K=32 with one scale pair is exactly st_fdpa.
+
+    SEMANTICS WARNING: for K > 32 this models NO real TensorCore instruction.
+    The hardware path for K > 32 is the per-block chain (mxfp8_dot), whose
+    intermediate FP32 roundings make it a different arithmetic: a 65/129-term
+    single node disagrees with the chain on a substantial fraction of inputs.
+    Use this to DEFINE a wider fused adder (e.g. N=65 or N=129 tree nodes),
+    not to claim hardware bit-exactness. The scale-NaN and Inf*0 paths return
+    the same canonical NaN the chain would end at.
+    """
+    K = len(a_bits)
+    if K == 0 or len(b_bits) != K:
+        raise ValueError("a and b must be non-empty and have the same length")
+    nblocks = (K + block - 1) // block
+    if len(sfa_bits) != nblocks or len(sfb_bits) != nblocks:
+        raise ValueError(f"expected {nblocks} scale pairs for K={K}, block={block}")
+
+    scale_exps: List[Optional[int]] = []
+    for j in range(nblocks):
+        ea = decode_ue8m0(sfa_bits[j])
+        eb = decode_ue8m0(sfb_bits[j])
+        scale_exps.append(None if ea is None or eb is None else ea + eb)
+
+    ta = [decode(x, fmt) for x in a_bits]
+    tb = [decode(x, fmt) for x in b_bits]
+    tc = decode(c_bits, FP32)
+
+    def nan_result(why: str) -> FdpaResult:
+        # NVIDIA canonical FP32 NaN
+        return FdpaResult(0x7FFFFFFF, float("nan"), None, None, None, why)
+
+    if any(e is None for e in scale_exps):
+        # the per-block chain would poison its running accumulator and end NaN
+        return nan_result("scale factor is NaN")
+    if any(t.kind == NAN for t in ta) or any(t.kind == NAN for t in tb):
+        return nan_result("NaN in A or B")
+    if tc.kind == NAN:
+        return nan_result("NaN in C")
+
+    # Products: form terms, detect Inf*0 and collect infinity signs.
+    terms: List[Term] = []
+    inf_signs = set()
+    for k, (x, y) in enumerate(zip(ta, tb)):
+        if x.kind == INF or y.kind == INF:
+            if x.kind == ZERO or y.kind == ZERO:
+                return nan_result("Inf * 0")
+            inf_signs.add(x.sign * y.sign)
+            continue
+        if x.kind == ZERO or y.kind == ZERO:
+            continue
+        terms.append(
+            Term(FINITE, x.sign * y.sign, x.sig * y.sig, x.P + y.P,
+                 x.exp + y.exp + scale_exps[k // block])
+        )
+
+    if tc.kind == INF:
+        inf_signs.add(tc.sign)
+    elif tc.kind == FINITE:
+        terms.append(tc)
+
+    if inf_signs:
+        if len(inf_signs) > 1:
+            return nan_result("+Inf and -Inf in the same dot product")
+        s = inf_signs.pop()
+        bits = (0x80000000 if s < 0 else 0) | 0x7F800000
+        return FdpaResult(bits, float("-inf") if s < 0 else float("inf"),
+                          None, None, None, "infinite term dominates")
+
+    if not terms:
+        return FdpaResult(0, 0.0, None, 0, [], "all terms zero")
+
+    e_max = max(t.exp for t in terms)
+    if tc.kind == ZERO:
+        e_max = max(e_max, -133)  # zero terms sit at e_zero = -133
+
+    aligned = []
+    for t in terms:
+        shift = (t.exp - e_max) + (F - t.P)
+        aligned.append(_shift_right_rz(t.sign * t.sig, -shift))
+
+    S = sum(aligned)  # exact: Python ints
+    bits = exact_to_fp32_bits(S, e_max - F, overflow_to_inf=overflow_to_inf)
+    return FdpaResult(bits, fp32_bits_to_float(bits), e_max, S, aligned)
+
+
 def mxfp8_dot(
     a_bits: Sequence[int],
     b_bits: Sequence[int],
@@ -589,6 +692,48 @@ def test_zero_c_sets_alignment_floor():
     print("zero-c alignment floor      : killed -> +0, underflow keeps -0")
 
 
+def test_st_fdpa_n_generalization():
+    """K=32 must reproduce st_fdpa bit-for-bit; K=64/128 keep the
+    scale-is-a-pure-exponent-shift property."""
+    import random as _r
+
+    _r.seed(11)
+    for _ in range(2000):
+        a = [_r.randrange(256) for _ in range(32)]
+        b = [_r.randrange(256) for _ in range(32)]
+        sfa, sfb = _r.randrange(256), _r.randrange(256)
+        c = _r.randrange(1 << 32)
+        r1 = st_fdpa(a, b, c, sfa, sfb)
+        r2 = st_fdpa_n(a, b, c, [sfa], [sfb])
+        assert r1.bits == r2.bits, (r1.bits, r2.bits)
+    for K in (64, 128):
+        nb = K // 32
+
+        def _finite_vec(n):
+            out = []
+            for _ in range(n):
+                v = _r.randrange(0x7F)  # 0x00..0x7E: finite E4M3
+                out.append(v | 0x80 if _r.random() < 0.5 else v)
+            return out
+
+        a = _finite_vec(K)
+        b = _finite_vec(K)
+        sfa = [_r.randrange(255) for _ in range(nb)]
+        sfb = [_r.randrange(255) for _ in range(nb)]
+        base = st_fdpa_n(a, b, 0, sfa, sfb).value
+        assert base != 0.0
+        for p, q in [(5, 0), (0, 5), (-7, 7)]:
+            r = st_fdpa_n(a, b, 0, [x + p for x in sfa], [x + q for x in sfb])
+            assert -126 < _r_log2(base) + p + q < 126  # stay in normal range
+            assert r.value == base * 2.0 ** (p + q), (K, p, q, r.value)
+    print("st_fdpa_n (65/129-term)      : K=32 identical to st_fdpa; shift property ok")
+
+
+def _r_log2(x: float) -> int:
+    import math
+    return int(math.floor(math.log2(abs(x))))
+
+
 def run_all():
     for t in (
         test_basic,
@@ -602,6 +747,7 @@ def run_all():
         test_subnormal_input_and_output,
         test_multi_block_chaining,
         test_zero_c_sets_alignment_floor,
+        test_st_fdpa_n_generalization,
     ):
         t()
     print("\nall self-checks passed")
