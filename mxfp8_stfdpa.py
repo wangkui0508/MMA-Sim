@@ -181,14 +181,27 @@ def _shift_right_rz(v: int, n: int) -> int:
     return -((-v) >> n)
 
 
-def exact_to_fp32_bits(S: int, exp2: int, *, overflow_to_inf: bool = True) -> int:
-    """Convert the exact value S * 2**exp2 to FP32 bits with round-toward-zero.
+def exact_to_fp32_bits(
+    S: int,
+    exp2: int,
+    *,
+    overflow_to_inf: bool = True,
+    rounding: str = "RTZ",
+) -> int:
+    """Convert the exact value S * 2**exp2 to FP32 bits.
+
+    rounding: "RTZ" (truncate toward zero -- the hardware behaviour), "RNE"
+    (nearest, ties to even), or "RNA" (nearest, ties away from zero). The
+    mode applies to the 24-bit-significand rounding and to subnormal
+    quantisation; underflow to zero keeps the sign in every mode.
 
     overflow_to_inf: on magnitude overflow, return +/-Inf (matching the
     finite-accumulation-overflows-to-Inf behaviour reported for these tensor
     cores) rather than the largest finite value that a literal IEEE RZ
     conversion would produce. Flip it if you want strict IEEE RZ semantics.
     """
+    if rounding not in ("RTZ", "RNE", "RNA"):
+        raise ValueError(f"rounding must be RTZ, RNE or RNA, got {rounding!r}")
     if S == 0:
         return 0  # +0.0; exact cancellation is reported as +0 by these units
     sign_bit = 0x80000000 if S < 0 else 0
@@ -196,17 +209,40 @@ def exact_to_fp32_bits(S: int, exp2: int, *, overflow_to_inf: bool = True) -> in
     E = exp2 + M.bit_length() - 1  # unbiased exponent of the leading 1
 
     if E < FP32.emin:  # subnormal or underflow to zero
-        m = _shift_right_rz(M, -149 - exp2)
+        shift = -149 - exp2
+        if shift <= 0:
+            m = M << (-shift)  # exact: at least min-subnormal granularity
+        else:
+            m, rem = divmod(M, 1 << shift)
+            half = 1 << (shift - 1)
+            if rounding == "RNE" and (rem > half or (rem == half and m & 1)):
+                m += 1
+            elif rounding == "RNA" and rem >= half:
+                m += 1
         if m == 0:
-            return sign_bit  # underflow preserves the sign (trunc(-tiny) = -0.0)
+            return sign_bit
+        if m > (1 << FP32.man_bits) - 1:  # rounded up into the min normal
+            return sign_bit | (1 << FP32.man_bits)
         return sign_bit | m  # exponent field 0
 
-    frac = _shift_right_rz(M, M.bit_length() - (FP32.man_bits + 1))
+    shift = M.bit_length() - (FP32.man_bits + 1)
+    if shift > 0:
+        m, rem = divmod(M, 1 << shift)
+        half = 1 << (shift - 1)
+        if rounding == "RNE" and (rem > half or (rem == half and m & 1)):
+            m += 1
+        elif rounding == "RNA" and rem >= half:
+            m += 1
+        if m > (1 << (FP32.man_bits + 1)) - 1:  # carry: 1.11..1 + 1 ulp -> 2**(E+1)
+            m >>= 1
+            E += 1
+    else:
+        m = M << (-shift)
     if E > FP32.bias:  # overflow
         if overflow_to_inf:
             return sign_bit | 0x7F800000
         return sign_bit | 0x7F7FFFFF
-    return sign_bit | ((E + FP32.bias) << FP32.man_bits) | (frac - (1 << FP32.man_bits))
+    return sign_bit | ((E + FP32.bias) << FP32.man_bits) | (m - (1 << FP32.man_bits))
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +359,24 @@ def st_fdpa(
     return FdpaResult(bits, fp32_bits_to_float(bits), e_max, S, aligned)
 
 
+def _round_shift_int(v: int, shift: int, rounding: str) -> int:
+    """Round the exact value v * 2**shift to an integer.
+
+    shift >= 0 is an exact left shift. shift < 0 quantises: RTZ truncates
+    toward zero, RNE rounds to nearest with ties to even, RNA to nearest with
+    ties away from zero. For rounding="RTZ" this is exactly _shift_right_rz.
+    """
+    if shift >= 0:
+        return v << shift
+    q, rem = divmod(abs(v), 1 << -shift)
+    half = 1 << (-shift - 1)
+    if rounding == "RNE" and (rem > half or (rem == half and q & 1)):
+        q += 1
+    elif rounding == "RNA" and rem >= half:
+        q += 1
+    return -q if v < 0 else q
+
+
 def st_fdpa_n(
     a_bits: Sequence[int],
     b_bits: Sequence[int],
@@ -334,6 +388,8 @@ def st_fdpa_n(
     F: int = 25,
     block: int = 32,
     overflow_to_inf: bool = True,
+    rounding: str = "RTZ",
+    align_rounding: Optional[str] = None,
 ) -> FdpaResult:
     """Generalized N-term fused scaled dot-product-accumulate: K products + c.
 
@@ -350,7 +406,22 @@ def st_fdpa_n(
     Use this to DEFINE a wider fused adder (e.g. N=65 or N=129 tree nodes),
     not to claim hardware bit-exactness. The scale-NaN and Inf*0 paths return
     the same canonical NaN the chain would end at.
+
+    rounding: mode of the final FP32 conversion -- "RTZ" (truncate, the
+    hardware behaviour), "RNE" (nearest, ties to even), or "RNA" (nearest,
+    ties away).
+    align_rounding: mode of the per-term alignment on entry to the adder tree
+    ("per-term": RTZ wire-truncation, RNE/RNA need a per-input incrementer,
+    which real CSA trees avoid). None (default) follows `rounding`.
+    "RTZ" at both points reproduces the hardware behaviour. Note the per-term
+    choice dominates accuracy for small F (alignment truncation is the main
+    error source there), while the output choice matters for F >= 25.
     """
+    if rounding not in ("RTZ", "RNE", "RNA"):
+        raise ValueError(f"rounding must be RTZ, RNE or RNA, got {rounding!r}")
+    align_mode = rounding if align_rounding is None else align_rounding
+    if align_mode not in ("RTZ", "RNE", "RNA"):
+        raise ValueError(f"align_rounding must be RTZ, RNE or RNA, got {align_mode!r}")
     K = len(a_bits)
     if K == 0 or len(b_bits) != K:
         raise ValueError("a and b must be non-empty and have the same length")
@@ -419,10 +490,11 @@ def st_fdpa_n(
     aligned = []
     for t in terms:
         shift = (t.exp - e_max) + (F - t.P)
-        aligned.append(_shift_right_rz(t.sign * t.sig, -shift))
+        aligned.append(_round_shift_int(t.sign * t.sig, shift, align_mode))
 
     S = sum(aligned)  # exact: Python ints
-    bits = exact_to_fp32_bits(S, e_max - F, overflow_to_inf=overflow_to_inf)
+    bits = exact_to_fp32_bits(S, e_max - F, overflow_to_inf=overflow_to_inf,
+                              rounding=rounding)
     return FdpaResult(bits, fp32_bits_to_float(bits), e_max, S, aligned)
 
 
@@ -734,6 +806,63 @@ def _r_log2(x: float) -> int:
     return int(math.floor(math.log2(abs(x))))
 
 
+def test_st_fdpa_n_rounding():
+    """RNE / RNA / RTZ conversion semantics on exact_to_fp32_bits, plus
+    end-to-end tie cases through st_fdpa_n. w=25 RTZ must stay identical to
+    the hardware-verified default."""
+    import random as _r
+
+    _r.seed(5)
+    for _ in range(500):
+        K = _r.choice([32, 64, 128])
+        nb = K // 32
+        a = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(K)]
+        b = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(K)]
+        sfa = [_r.randrange(255) for _ in range(nb)]
+        sfb = [_r.randrange(255) for _ in range(nb)]
+        c = _r.randrange(1 << 32)
+        assert st_fdpa_n(a, b, c, sfa, sfb).bits == st_fdpa_n(
+            a, b, c, sfa, sfb, rounding="RTZ").bits
+
+    to_fp32 = float_to_fp32_bits
+    # halfway between 1.0 and 1+2**-23: RNE keeps the even side
+    assert exact_to_fp32_bits(2**24 + 1, -24, rounding="RNE") == to_fp32(1.0)
+    assert exact_to_fp32_bits(2**24 + 1, -24, rounding="RNA") == to_fp32(1.0 + 2.0**-23)
+    assert exact_to_fp32_bits(2**24 + 1, -24, rounding="RTZ") == to_fp32(1.0)
+    # halfway just below 2.0: RNE rounds up to the even 2.0 (carry)
+    assert exact_to_fp32_bits(2**25 - 1, -24, rounding="RNE") == to_fp32(2.0)
+    assert exact_to_fp32_bits(2**25 - 1, -24, rounding="RNA") == to_fp32(2.0)
+    assert exact_to_fp32_bits(2**25 - 1, -24, rounding="RTZ") == to_fp32(2.0 - 2.0**-23)
+    # negative halfway: RNE keeps even, RNA goes away from zero, RTZ toward
+    assert exact_to_fp32_bits(-(2**24 + 1), -24, rounding="RNE") == to_fp32(-1.0)
+    assert exact_to_fp32_bits(-(2**24 + 1), -24, rounding="RNA") == to_fp32(-(1.0 + 2.0**-23))
+    # subnormal tie at 2.5 * 2**-149
+    assert exact_to_fp32_bits(5, -150, rounding="RNE") == 2
+    assert exact_to_fp32_bits(5, -150, rounding="RNA") == 3
+    # subnormal rounding up into the min normal
+    assert exact_to_fp32_bits(2**24 - 1, -150, rounding="RNE") == 0x00800000
+    assert exact_to_fp32_bits(2**24 - 1, -150, rounding="RTZ") == 0x007FFFFF
+    # end-to-end: shared scale 2**-3 per operand; products 64.0 and 2**-18
+    # become 1.0 and 2**-24 -- sum lands exactly halfway at 1+2**-24
+    a, b = [0x50, 0x01], [0x50, 0x01]
+    sfa = sfb = [e8m0_bits(-3)]
+    assert st_fdpa_n(a, b, 0, sfa, sfb, rounding="RNE").bits == to_fp32(1.0)
+    assert st_fdpa_n(a, b, 0, sfa, sfb, rounding="RNA").bits == to_fp32(1.0 + 2.0**-23)
+    assert st_fdpa_n(a, b, 0, sfa, sfb, rounding="RTZ").bits == to_fp32(1.0)
+    # end-to-end: product 1.0 + c = 1+2**-23 sums to 2+2**-23, half an ulp of 2
+    c = to_fp32(1.0 + 2.0**-23)
+    assert st_fdpa_n([0x38], [0x38], c, [0x7F], [0x7F], rounding="RNE").bits == to_fp32(2.0)
+    assert st_fdpa_n([0x38], [0x38], c, [0x7F], [0x7F], rounding="RNA").bits == to_fp32(2.0 + 2.0**-22)
+    # per-term alignment rounding (F=17 grid, 64x coarser than the output ulp):
+    # the small product 2**-18 sits exactly half a grid unit below 1.0 --
+    # RTZ/RNE drop it (tie -> even 0), RNA's tie-away revives it as 1 unit
+    a, b = [0x38, 0x01], [0x38, 0x01]
+    assert st_fdpa_n(a, b, 0, [0x7F], [0x7F], F=17, rounding="RTZ").bits == to_fp32(1.0)
+    assert st_fdpa_n(a, b, 0, [0x7F], [0x7F], F=17, rounding="RNE").bits == to_fp32(1.0)
+    assert st_fdpa_n(a, b, 0, [0x7F], [0x7F], F=17, rounding="RNA").bits == to_fp32(1.0 + 2.0**-17)
+    print("st_fdpa_n rounding           : RTZ == hardware default; RNE/RNA ties, carry, subnormal, per-term ok")
+
+
 def run_all():
     for t in (
         test_basic,
@@ -748,6 +877,7 @@ def run_all():
         test_multi_block_chaining,
         test_zero_c_sets_alignment_floor,
         test_st_fdpa_n_generalization,
+        test_st_fdpa_n_rounding,
     ):
         t()
     print("\nall self-checks passed")
