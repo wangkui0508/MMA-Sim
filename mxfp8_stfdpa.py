@@ -53,9 +53,9 @@ An OPT-IN simplified normalise stage (RNORM) is also provided for area/power
 studies: it replaces the final FP32 conversion with a cheap approximate
 normalise that keeps (sign, mantissa, exponent) in a reduced form. It trades a
 little precision for a much smaller CLZ/barrel-shifter. It is NOT bit-accurate
-to any real hardware (except at the man_bits = W - scan_bits operating point,
-which is bit-identical to this reference model); see the "Reduced-precision
-normalisation" section below.
+to any real hardware (except at the man_bits = W - total_shift_bits operating
+point with shift_unit = 1, which is bit-identical to this reference model);
+see the "Reduced-precision normalisation" section below.
 """
 
 from __future__ import annotations
@@ -284,41 +284,59 @@ def exact_to_fp32_bits(
 #      yields an EXACT (m, e) pair for the bits it keeps; the pair simply may
 #      show leading zeros in m (under-normalised but not wrong).
 #
-# Scheme (reduce_normalize):
+# Scheme (reduce_normalize) -- two knobs:
 #
-#   * scan_bits-input priority encoder examines the top scan_bits bits of the
-#     fixed W-bit register.
-#       - HIT (common): the leading one is inside the scanned window, so the
-#         exponent is EXACT and m is fully normalised (leading one at bit
-#         man_bits-1). Identical to the reference except for the low-bit
-#         truncation implied by the narrower mantissa. The barrel shifter only
-#         ever right-shifts by scan_bits distinct amounts (a 3-bit control).
-#       - MISS (cancellation: the sum fell below the scanned window): emit the
-#         FIXED window just below the scan (a wire slice -- no shifter at
-#         all). Rule: never over-estimate the exponent, so the pair stays
-#         exact; precision degrades smoothly as the sum cancels (fewer
-#         significant bits kept). If even that window is empty
-#         (|S| < 2**(W - scan_bits - man_bits)) the value is flushed to +/-0
+#   shift_unit      (g): the barrel shifter only shifts by multiples of g
+#                       (1, 2, 4, ...). The mantissa window top can only sit
+#                       on the chunk boundaries W-1-k*g, so a leading one in
+#                       the middle of a chunk costs up to g-1 leading zeros
+#                       in m (a precision loss of up to g-1 bits -- the
+#                       price of a coarser shifter).
+#   total_shift_bits (T): the scan region is the top T bits of the fixed
+#                       W-bit register, tested in chunks of g (K = ceil(T/g)
+#                       chunk tests, each a g-input OR). T is also the
+#                       shifter's total range.
+#
+#   * K chunk tests from the top of the register:
+#       - HIT (common): the leading one sits in the top T bits. The window
+#         top is the smallest chunk boundary >= p, so the exponent is
+#         exact for that window and m keeps man_bits - (j-p) significant
+#         bits (fully normalised only when j == p, i.e. shift_unit == 1 or
+#         p on a boundary). The shifter has K distinct positions, i.e.
+#         ceil(log2 K) control bits.
+#       - MISS (cancellation: the sum fell below the scanned region): emit
+#         the FIXED window just below the scan at j = W-1-T (a wire slice
+#         -- no shifter at all). Rule: never over-estimate the exponent, so
+#         the pair stays exact; precision degrades smoothly as the sum
+#         cancels (fewer significant bits kept). If even that window is
+#         empty (|S| < 2**(W - T - man_bits)) the value is flushed to +/-0
 #         -- the only truly lossy corner. fallback="exact" instead pays a
 #         full-width CLZ (slow path / second cycle) and never flushes.
 #
-# Area (order of magnitude, default W=32, man_bits=16, scan_bits=8):
-#   CLZ         32-input tree        -> 8-input encoder (~3x smaller, shallower)
-#   barrel      bidirectional 32->24 -> right-only 32->16, 3-bit control
-#               (~5-6 mux levels     (~3 levels; the miss path is free)
-#                both directions)
-#   rounder     none either way (RTZ truncation, no carry)
-#   c feedback  32-bit FP32 (24-bit  -> 1 + man_bits + ~10 = 27-bit (sign,m,e)
-#               significand)         (exponent range ~[-160, 280] incl. E8M0)
-#   precision   fast-path truncation < 2**-(man_bits-1) relative per block
-#               (2**-15 at man_bits=16 vs 2**-23 for FP32); miss region keeps
-#               fewer significant bits; flush is the only hard loss.
+# Design space (W=32, man_bits=16):
+#   shift_unit     1        2        4        <- chunk granularity
+#   total_shift    8,12,16  8,12,16  8,12,16  <- scan region / shifter range
+#   hit precision  man_bits  -0..1    -0..3 bits vs the g=1 design
+#   flush below    p<8       p<8      p<8     (T=8); never at T = W - man_bits
 #
-# FREE OPERATING POINT: man_bits = W - scan_bits (24 at W=32, scan_bits=8)
-# makes the scheme BIT-IDENTICAL to the reference in every case (the fast path
-# truncates to 24 bits exactly like FP32-RTZ; the miss window holds the whole
-# value; the flush cannot fire), while still shrinking the CLZ and shifter.
-# See test_rnorm_zero_precision_loss().
+# Area (order of magnitude, W=32, man_bits=16, shift_unit=4, total_shift_bits=8):
+#   CLZ         32-input tree      -> 2 chunk-ORs + 2-input encoder (1 bit)
+#   barrel      bidirectional      -> right-only 32->16, 2 positions (1 bit)
+#               32->24, 5-6 levels    (~1-2 levels; miss path free)
+#   rounder     none either way (RTZ truncation, no carry)
+#   c feedback  32-bit FP32 (24-bit -> 1 + man_bits + ~10 = 27-bit (sign,m,e)
+#               significand)         (exponent range ~[-160, 280] incl. E8M0)
+#   precision   hit truncation < 2**-(man_bits - g + 1) relative per block
+#               (2**-13 at man_bits=16, g=4 vs 2**-15 at g=1); miss region
+#               keeps fewer significant bits; flush is the only hard loss.
+#
+# FREE OPERATING POINT: man_bits = W - total_shift_bits with shift_unit = 1
+# (24 at W=32, T=8) makes the scheme BIT-IDENTICAL to the reference in every
+# case (the hit path truncates to 24 bits exactly like FP32-RTZ; the miss
+# window holds the whole value; the flush cannot fire), while still shrinking
+# the CLZ and shifter. With shift_unit > 1 the granularity costs up to g-1
+# bits in the hit path, so bit-identity is lost there.
+# See test_rnorm_zero_precision_loss() and test_rnorm_shift_grid().
 #
 # The signed-mantissa alternative: the model keeps sign + magnitude (matching
 # the Term convention). Hardware on a two's-complement datapath can equally
@@ -331,18 +349,20 @@ class Reduced:
     """A reduced-precision floating value: sign * m * 2**(exp - P).
 
     m is an unsigned integer of up to man_bits bits (P == man_bits - 1). In
-    the HIT ("fast") path m is fully normalised with the leading one at bit
-    man_bits - 1; in the MISS ("fallback") path m may carry leading zeros
-    (under-normalised but exact for the bits it keeps). m == 0 is a flushed
-    zero that keeps the sign. kept is the number of significant mantissa bits
-    actually carried by m.
+    the HIT paths ("fast" / "chunk") the window top is a chunk boundary at or
+    above the leading one: "fast" is fully normalised (leading one at bit
+    man_bits - 1), "chunk" carries up to shift_unit - 1 leading zeros. In the
+    MISS ("fallback") path m may carry leading zeros (under-normalised but
+    exact for the bits it keeps). m == 0 is a flushed zero that keeps the
+    sign. kept is the number of significant mantissa bits actually carried
+    by m.
     """
 
     sign: int
     m: int
     P: int
     exp: int
-    note: str  # "zero" | "fast" | "fallback" | "flush" | "exact"
+    note: str  # "zero" | "fast" | "chunk" | "fallback" | "flush" | "exact"
     kept: int
 
 
@@ -351,7 +371,8 @@ def reduce_normalize(
     exp2: int,
     *,
     man_bits: int = 16,
-    scan_bits: int = 8,
+    shift_unit: int = 1,
+    total_shift_bits: int = 8,
     W: int = 32,
     fallback: str = "flush",
 ) -> Reduced:
@@ -362,21 +383,35 @@ def reduce_normalize(
     design rationale; the returned pair is exact for the bits it keeps, and
     only the (bounded) low-bit truncation plus the rare flush are lossy.
 
-    man_bits : mantissa width, explicit leading one in the fast path.
-    scan_bits: how many top bits of the fixed-width register the cheap CLZ
-               examines (the user's "only the top 8 bits").
-    W        : fixed datapath width of the accumulator register. Pass the
-               design width; the default 32 matches the 32-term E4M3 F=25
-               datapath that st_fdpa_fast derives. W=None disables the scan
-               entirely and uses a full-width CLZ (reference mode: reduced
-               mantissa width only, exact exponent, never flushes).
-    fallback : "flush" -- empty miss window reports +/-0 (fast, fixed
-               latency); "exact" -- empty miss window pays a full CLZ (slow
-               path / second cycle) and never flushes.
+    man_bits         : mantissa width, explicit leading one in the fast path.
+    shift_unit       : the barrel shifter only shifts by multiples of this
+                       (power of two; 1 = bit granularity, 2/4 = coarser).
+                       The mantissa window top sits on chunk boundaries
+                       W-1-k*shift_unit, costing up to shift_unit-1 leading
+                       zeros in m.
+    total_shift_bits : the scan region is the top total_shift_bits bits of
+                       the fixed-width register, tested in chunks of
+                       shift_unit; also the shifter's total range. The flush
+                       threshold is |S| < 2**(W - total_shift_bits -
+                       man_bits), so total_shift_bits = W - man_bits never
+                       flushes.
+    W                : fixed datapath width of the accumulator register. Pass
+                       the design width; the default 32 matches the 32-term
+                       E4M3 F=25 datapath that st_fdpa_fast derives. W=None
+                       disables the scan entirely and uses a full-width CLZ
+                       (reference mode: reduced mantissa width only, exact
+                       exponent, never flushes).
+    fallback         : "flush" -- empty miss window reports +/-0 (fast, fixed
+                       latency); "exact" -- empty miss window pays a full CLZ
+                       (slow path / second cycle) and never flushes.
     """
-    if man_bits < 1 or scan_bits < 1 or fallback not in ("flush", "exact"):
+    if man_bits < 1 or fallback not in ("flush", "exact"):
         raise ValueError(f"bad reduce_normalize args: man_bits={man_bits}, "
-                         f"scan_bits={scan_bits}, fallback={fallback!r}")
+                         f"fallback={fallback!r}")
+    g = shift_unit
+    T = total_shift_bits
+    if g < 1 or g & (g - 1):
+        raise ValueError(f"shift_unit must be a power of two, got {g}")
     if S == 0:
         return Reduced(1, 0, man_bits - 1, exp2, "zero", 0)
     sign = 1 if S > 0 else -1
@@ -388,27 +423,33 @@ def reduce_normalize(
         m = (A >> shift) & ((1 << man_bits) - 1) if shift >= 0 else A << (-shift)
         return Reduced(sign, m, man_bits - 1, exp2 + p, "exact", man_bits)
 
-    if scan_bits > W or W < man_bits + scan_bits:
+    if T < 1 or T > W - man_bits:
         raise ValueError(
-            f"need scan_bits <= W and W >= man_bits + scan_bits "
-            f"(got W={W}, man_bits={man_bits}, scan_bits={scan_bits})")
+            f"need 1 <= total_shift_bits <= W - man_bits ({W - man_bits}), "
+            f"got {T}")
+    if g > T or g > man_bits:
+        raise ValueError(
+            f"need shift_unit <= min(total_shift_bits, man_bits), "
+            f"got shift_unit={g}, total_shift_bits={T}, man_bits={man_bits}")
     if A.bit_length() > W:  # datapath overflow: saturate at the register top
         A = (1 << W) - 1
         p = W - 1
 
-    # HIT: leading one inside the top scan_bits bits -> exact exponent.
-    top = A >> (W - scan_bits)
-    if top:
-        c8 = top.bit_length()  # 1..scan_bits
-        p_est = W - scan_bits + c8 - 1
-        assert p_est == p, (p_est, p)  # the scan is exact when it fires
-        shift = p - (man_bits - 1)
+    # HIT: leading one inside the top T bits. The window top is the smallest
+    # chunk boundary >= p, so the pair is exact for the bits it keeps and m
+    # shows up to g-1 leading zeros (fully normalised only when j == p).
+    if p >= W - T:
+        k = (W - 1 - p) // g
+        j = W - 1 - k * g            # smallest chunk boundary >= p
+        shift = j - (man_bits - 1)   # >= 1 here (T <= W - man_bits, g <= man_bits)
         m = (A >> shift) & ((1 << man_bits) - 1)
-        return Reduced(sign, m, man_bits - 1, exp2 + p, "fast", man_bits)
+        note = "fast" if j == p else "chunk"
+        return Reduced(sign, m, man_bits - 1, exp2 + j, note,
+                       man_bits - (j - p))
 
-    # MISS: value shrank below the scanned window (cancellation). Fixed
+    # MISS: value shrank below the scanned region (cancellation). Fixed
     # window just below the scan, never above the true leading one.
-    j = W - 1 - scan_bits          # top bit of the fixed window
+    j = W - 1 - T              # top bit of the fixed window
     bottom = j - (man_bits - 1)
     if p < bottom:
         if fallback == "flush":
@@ -567,7 +608,8 @@ def st_fdpa_fast(
     fmt: FpFormat = E4M3,
     F: int = 25,
     man_bits: int = 16,
-    scan_bits: int = 8,
+    shift_unit: int = 1,
+    total_shift_bits: int = 8,
     fallback: str = "flush",
     overflow_to_inf: bool = True,
 ) -> FdpaResult:
@@ -579,6 +621,11 @@ def st_fdpa_fast(
     of that pair (m < 2**24 is lossless), so chaining the bits is identical to
     chaining the reduced pair directly -- the next block's c carries a
     man_bits-bit significand instead of 24 bits.
+
+    shift_unit / total_shift_bits configure the cheap CLZ + shifter: the
+    scan covers the top total_shift_bits bits in chunks of shift_unit (see
+    reduce_normalize). shift_unit=1, total_shift_bits=8 is the default 8-bit
+    bit-granular scan.
 
     Special-value results (NaN / Inf / all-zero) are unchanged from st_fdpa.
     The datapath width W is derived from the design: W = F + 1 +
@@ -593,7 +640,8 @@ def st_fdpa_fast(
     L = len(a_bits)
     W = F + 1 + (L + 1).bit_length()  # fixed register width of this datapath
     red = reduce_normalize(r.S, r.e_max - F, man_bits=man_bits,
-                           scan_bits=scan_bits, W=W, fallback=fallback)
+                           shift_unit=shift_unit, total_shift_bits=total_shift_bits,
+                           W=W, fallback=fallback)
     bits = reduced_to_fp32_bits(red, overflow_to_inf=overflow_to_inf)
     return FdpaResult(bits, fp32_bits_to_float(bits), r.e_max, r.S, r.aligned,
                       f"rnorm:{red.note}")
@@ -784,7 +832,8 @@ def mxfp8_dot_fast(
     F: int = 25,
     block: int = 32,
     man_bits: int = 16,
-    scan_bits: int = 8,
+    shift_unit: int = 1,
+    total_shift_bits: int = 8,
     fallback: str = "flush",
 ) -> int:
     """Chain fused dot products with the RNORM normalise between blocks.
@@ -792,7 +841,7 @@ def mxfp8_dot_fast(
     Identical structure to mxfp8_dot, but each block runs st_fdpa_fast, so the
     c fed forward carries a man_bits-bit significand instead of FP32's 24.
     Returns raw FP32 bits. NOT bit-accurate (except at man_bits = W -
-    scan_bits, see test_rnorm_zero_precision_loss).
+    total_shift_bits with shift_unit = 1, see test_rnorm_zero_precision_loss).
     """
     K = len(a_bits)
     if len(b_bits) != K:
@@ -806,7 +855,8 @@ def mxfp8_dot_fast(
         lo, hi = i * block, min((i + 1) * block, K)
         r = st_fdpa_fast(a_bits[lo:hi], b_bits[lo:hi], d, sfa_bits[i],
                          sfb_bits[i], fmt=fmt, F=F, man_bits=man_bits,
-                         scan_bits=scan_bits, fallback=fallback)
+                         shift_unit=shift_unit,
+                         total_shift_bits=total_shift_bits, fallback=fallback)
         d = r.bits
     return d
 
@@ -1142,11 +1192,11 @@ def test_st_fdpa_n_rounding():
 
 
 def test_rnorm_reduce_normalize_units():
-    """The three paths of the cheap normalise, by hand.
+    """The paths of the cheap normalise, by hand.
 
-    W=32, man_bits=16, scan_bits=8: the scan covers bits 31..24, the fixed
-    miss window sits at bits 23..8, and values with a leading one below bit 7
-    flush.
+    Defaults W=32, man_bits=16, shift_unit=1, total_shift_bits=8: the scan
+    covers bits 31..24, the fixed miss window sits at bits 23..8, and values
+    with a leading one below bit 7 flush.
     """
     # HIT: S = 2**25 + 12345 (leading one at bit 25, inside bits 31..24).
     r = reduce_normalize(2**25 + 12345, -25)
@@ -1220,8 +1270,9 @@ def test_rnorm_block_paths():
 
 
 def test_rnorm_zero_precision_loss():
-    """The free operating point: man_bits = W - scan_bits (24 at W=32) makes
-    the cheap normalise bit-identical to the reference model, always."""
+    """The free operating point: man_bits = W - total_shift_bits (24 at
+    W=32, T=8) with shift_unit = 1 makes the cheap normalise bit-identical
+    to the reference model, always."""
     import random as _r
 
     _r.seed(7)
@@ -1230,7 +1281,7 @@ def test_rnorm_zero_precision_loss():
         b = [_r.randrange(256) for _ in range(32)]
         sfa, sfb, c = _r.randrange(256), _r.randrange(256), _r.randrange(1 << 32)
         r1 = st_fdpa(a, b, c, sfa, sfb)
-        r2 = st_fdpa_fast(a, b, c, sfa, sfb, man_bits=24, scan_bits=8)
+        r2 = st_fdpa_fast(a, b, c, sfa, sfb, man_bits=24, total_shift_bits=8)
         assert r1.bits == r2.bits, (r1.bits, r2.bits, r2.note)
     for _ in range(300):
         K = _r.choice([64, 128])
@@ -1240,8 +1291,91 @@ def test_rnorm_zero_precision_loss():
         sfa = [_r.randrange(255) for _ in range(nb)]
         sfb = [_r.randrange(255) for _ in range(nb)]
         assert mxfp8_dot(a, b, sfa, sfb) == mxfp8_dot_fast(
-            a, b, sfa, sfb, man_bits=24, scan_bits=8), (K,)
+            a, b, sfa, sfb, man_bits=24, total_shift_bits=8), (K,)
     print("rnorm zero-precision-loss    : man_bits=24 == reference bit-for-bit")
+
+
+def test_rnorm_shift_grid():
+    """The (shift_unit, total_shift_bits) grid: coarser shift granularity
+    places the mantissa window on chunk boundaries (up to g-1 leading zeros,
+    exact for the kept bits); a wider shift range shrinks the flush corner,
+    which disappears entirely at total_shift_bits = W - man_bits."""
+    # unit-level chunk placement, by hand (W=32, man_bits=16)
+    r = reduce_normalize(2**30 + 2**29 + 1, 0, man_bits=16, shift_unit=4)
+    assert r.note == "chunk" and r.kept == 15 and r.exp == 31
+    assert r.m == 2**14 + 2**13 and reduced_to_float(r) == 2.0 ** 30 + 2.0 ** 29
+    r = reduce_normalize(2**31, 0, man_bits=16, shift_unit=4)
+    assert r.note == "fast" and r.kept == 16 and r.exp == 31  # on a boundary
+    r = reduce_normalize(2**26, 0, man_bits=16, shift_unit=4)
+    assert r.note == "chunk" and r.kept == 15 and r.exp == 27
+    r = reduce_normalize(2**29 + 2**28, 0, man_bits=16, shift_unit=2)
+    assert r.note == "fast" and r.exp == 29  # on a 2-boundary
+    # non-power-of-two total (T=12, g=4 -> chunks of bits 31..28/27..24/23..20)
+    r = reduce_normalize(2**22 + 1, 0, man_bits=16, shift_unit=4, total_shift_bits=12)
+    assert r.note == "chunk" and r.exp == 23 and r.kept == 15
+    r = reduce_normalize(2**19 + 3, 0, man_bits=16, shift_unit=4, total_shift_bits=12)
+    assert r.note == "fallback" and r.exp == 19 and r.m == 2**15
+    assert reduce_normalize(2**3, 0, man_bits=16, shift_unit=4,
+                            total_shift_bits=12).note == "flush"  # p=3 < bottom=4
+    # T = W - man_bits never flushes: the miss window [15..0] holds everything
+    r = reduce_normalize(2**3, -3, man_bits=16, shift_unit=4, total_shift_bits=16)
+    assert r.note == "fallback" and reduced_to_float(r) == 1.0
+    assert reduce_normalize(1, 0, man_bits=16, shift_unit=4,
+                            total_shift_bits=16).note == "fallback"
+
+    # grid precision: coarser granularity costs precision, monotonically
+    import math
+    import random as _r
+
+    def worst_rel(g, T):
+        _r.seed(21)
+        w = 0.0
+        for _ in range(800):
+            K = _r.choice([32, 64, 128])
+            nb = K // 32
+            a = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(K)]
+            b = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(K)]
+            sfa = [_r.randrange(255) for _ in range(nb)]
+            sfb = [_r.randrange(255) for _ in range(nb)]
+            ex = fp32_bits_to_float(mxfp8_dot(a, b, sfa, sfb))
+            fa = fp32_bits_to_float(mxfp8_dot_fast(
+                a, b, sfa, sfb, man_bits=16, shift_unit=g,
+                total_shift_bits=T, fallback="exact"))
+            if ex == 0.0 or not (math.isfinite(ex) and math.isfinite(fa)):
+                continue
+            if abs(ex) < 2.0 ** -126:
+                continue  # normal-range only (relative metric)
+            w = max(w, abs(fa - ex) / abs(ex))
+        return w
+
+    w1, w2, w4 = worst_rel(1, 8), worst_rel(2, 8), worst_rel(4, 8)
+    print(f"rnorm shift grid (T=8)       : g=1 worst {w1:.3e}, "
+          f"g=2 {w2:.3e}, g=4 {w4:.3e} rel vs exact")
+    assert w4 >= w2 >= w1  # coarser granularity never improves precision
+    assert w1 < 2.0 ** -11  # g=1 identical to the original design
+
+    # wider shift range shrinks the flush corner: count block-level flush
+    # events (c=0 stress case, random scales) per total_shift_bits. At
+    # T = W - man_bits the miss window bottom is bit 0, so flushing is
+    # impossible by construction.
+    _r.seed(5)
+    flushes = {8: 0, 12: 0, 16: 0}
+    blocks = 0
+    for _ in range(6000):
+        a = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(32)]
+        b = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(32)]
+        sfa, sfb = _r.randrange(256), _r.randrange(256)
+        for T in flushes:
+            r = st_fdpa_fast(a, b, 0, sfa, sfb, man_bits=16, total_shift_bits=T)
+            if r.note == "rnorm:flush":
+                flushes[T] += 1
+        blocks += 1
+    print("rnorm shift grid (flush)     : c=0 blocks "
+          f"{flushes[8]}/{blocks} flush at T=8, {flushes[12]} at T=12, "
+          f"{flushes[16]} at T=16")
+    assert flushes[16] == 0  # T = W - man_bits: the flush corner is gone
+    assert flushes[8] >= flushes[12] >= flushes[16]
+    assert flushes[8] > 0  # the default T=8 still shows the corner
 
 
 def test_rnorm_precision_tradeoff():
@@ -1322,7 +1456,7 @@ def test_rnorm_hit_rate():
     import random as _r
 
     _r.seed(9)
-    stats = {"fast": 0, "fallback": 0, "flush": 0, "zero": 0}
+    stats = {"fast": 0, "chunk": 0, "fallback": 0, "flush": 0, "zero": 0}
     for _ in range(5000):
         a = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(32)]
         b = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(32)]
@@ -1330,9 +1464,10 @@ def test_rnorm_hit_rate():
         if r.note.startswith("rnorm:"):
             stats[r.note[6:]] += 1
     tot = sum(stats.values())
-    hit = stats["fast"] / tot
+    hit = (stats["fast"] + stats["chunk"]) / tot
     print(f"rnorm hit rate (8-bit scan)  : fast {stats['fast']} "
-          f"({hit:.1%}), fallback {stats['fallback']}, flush {stats['flush']}")
+          f"({hit:.1%} incl. chunk {stats['chunk']}), "
+          f"fallback {stats['fallback']}, flush {stats['flush']}")
     assert stats["flush"] == 0  # random data never cancels below the window
     assert hit > 0.9  # the dominant term keeps the sum in the scanned window
 
@@ -1355,6 +1490,7 @@ def run_all():
         test_rnorm_reduce_normalize_units,
         test_rnorm_block_paths,
         test_rnorm_zero_precision_loss,
+        test_rnorm_shift_grid,
         test_rnorm_precision_tradeoff,
         test_rnorm_hit_rate,
     ):
