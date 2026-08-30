@@ -51,11 +51,13 @@ NOT been validated against a physical B200 by the author of this file.
 
 An OPT-IN simplified normalise stage (RNORM) is also provided for area/power
 studies: it replaces the final FP32 conversion with a cheap approximate
-normalise that keeps (sign, mantissa, exponent) in a reduced form. It trades a
-little precision for a much smaller CLZ/barrel-shifter. It is NOT bit-accurate
-to any real hardware (except at the man_bits = W - total_shift_bits operating
-point with shift_unit = 1, which is bit-identical to this reference model);
-see the "Reduced-precision normalisation" section below.
+normalise that keeps (sign, mantissa, exponent) in a reduced form. It trades
+a little precision for a much smaller CLZ/barrel-shifter. It is NOT bit-
+accurate to any real hardware, EXCEPT at the default operating point
+(man_bits = W - total_shift_bits = 24, shift_unit = 1), which is
+bit-identical to this reference model; smaller man_bits narrow the c
+datapath at the cost of per-block truncation. See the "Reduced-precision
+normalisation" section below.
 """
 
 from __future__ import annotations
@@ -313,7 +315,8 @@ def exact_to_fp32_bits(
 #         -- the only truly lossy corner. fallback="exact" instead pays a
 #         full-width CLZ (slow path / second cycle) and never flushes.
 #
-# Design space (W=32, man_bits=16):
+# Design space (W=32; man_bits=24 is the default = bit-identical to FP32,
+# man_bits=16 the aggressive area point):
 #   shift_unit     1        2        4        <- chunk granularity
 #   total_shift    8,12,16  8,12,16  8,12,16  <- scan region / shifter range
 #   hit precision  man_bits  -0..1    -0..3 bits vs the g=1 design
@@ -325,17 +328,21 @@ def exact_to_fp32_bits(
 #               32->24, 5-6 levels    (~1-2 levels; miss path free)
 #   rounder     none either way (RTZ truncation, no carry)
 #   c feedback  32-bit FP32 (24-bit -> 1 + man_bits + ~10 = 27-bit (sign,m,e)
-#               significand)         (exponent range ~[-160, 280] incl. E8M0)
+#               significand)         at man_bits=16; 35-bit at man_bits=24
+#                                    (exponent range ~[-160, 280] incl. E8M0)
 #   precision   hit truncation < 2**-(man_bits - g + 1) relative per block
-#               (2**-13 at man_bits=16, g=4 vs 2**-15 at g=1); miss region
-#               keeps fewer significant bits; flush is the only hard loss.
+#               (2**-13 at man_bits=16, g=4 vs 2**-15 at g=1; ZERO at the
+#               default man_bits=24, g=1); miss region keeps fewer significant
+#               bits; flush is the only hard loss.
 #
-# FREE OPERATING POINT: man_bits = W - total_shift_bits with shift_unit = 1
-# (24 at W=32, T=8) makes the scheme BIT-IDENTICAL to the reference in every
-# case (the hit path truncates to 24 bits exactly like FP32-RTZ; the miss
-# window holds the whole value; the flush cannot fire), while still shrinking
-# the CLZ and shifter. With shift_unit > 1 the granularity costs up to g-1
-# bits in the hit path, so bit-identity is lost there.
+# DEFAULT OPERATING POINT (= FREE OPERATING POINT): man_bits =
+# W - total_shift_bits = 24 with shift_unit = 1 makes the scheme BIT-IDENTICAL
+# to the reference in every case (the hit path truncates to 24 bits exactly
+# like FP32-RTZ; the miss window holds the whole value; the flush cannot
+# fire), while still shrinking the CLZ and shifter. The default costs nothing
+# in precision; smaller man_bits (e.g. 16) additionally narrow the c datapath
+# at the price of per-block truncation. With shift_unit > 1 the granularity
+# costs up to g-1 bits in the hit path, so bit-identity is lost there.
 # See test_rnorm_zero_precision_loss() and test_rnorm_shift_grid().
 #
 # The signed-mantissa alternative: the model keeps sign + magnitude (matching
@@ -370,7 +377,7 @@ def reduce_normalize(
     S: int,
     exp2: int,
     *,
-    man_bits: int = 16,
+    man_bits: int = 24,
     shift_unit: int = 1,
     total_shift_bits: int = 8,
     W: int = 32,
@@ -384,6 +391,10 @@ def reduce_normalize(
     only the (bounded) low-bit truncation plus the rare flush are lossy.
 
     man_bits         : mantissa width, explicit leading one in the fast path.
+                       Default 24 (the free point: with the default W=32,
+                       T=8, g=1 the result is bit-identical to the reference
+                       FP32-RTZ conversion). Smaller values (e.g. 16) narrow
+                       the c datapath at the cost of per-block truncation.
     shift_unit       : the barrel shifter only shifts by multiples of this
                        (power of two; 1 = bit granularity, 2/4 = coarser).
                        The mantissa window top sits on chunk boundaries
@@ -607,29 +618,33 @@ def st_fdpa_fast(
     *,
     fmt: FpFormat = E4M3,
     F: int = 25,
-    man_bits: int = 16,
+    man_bits: int = 24,
     shift_unit: int = 1,
     total_shift_bits: int = 8,
     fallback: str = "flush",
     overflow_to_inf: bool = True,
 ) -> FdpaResult:
-    """The fused block with the cheap RNORM normalise (NOT bit-accurate).
+    """The fused block with the cheap RNORM normalise.
 
     Identical pipeline to st_fdpa up to the exact sum; only the final
     conversion differs: reduce_normalize produces a (sign, m, e) reduced pair
     instead of a full FP32. The block's result bits are the exact FP32 encode
     of that pair (m < 2**24 is lossless), so chaining the bits is identical to
     chaining the reduced pair directly -- the next block's c carries a
-    man_bits-bit significand instead of 24 bits.
+    man_bits-bit significand.
 
-    shift_unit / total_shift_bits configure the cheap CLZ + shifter: the
-    scan covers the top total_shift_bits bits in chunks of shift_unit (see
-    reduce_normalize). shift_unit=1, total_shift_bits=8 is the default 8-bit
-    bit-granular scan.
+    Defaults (man_bits=24, shift_unit=1, total_shift_bits=8, full 32-term
+    block) are the free operating point: bit-identical to st_fdpa. Lower
+    man_bits (e.g. 16) narrow the c datapath at the cost of per-block
+    truncation. shift_unit / total_shift_bits configure the cheap CLZ +
+    shifter: the scan covers the top total_shift_bits bits in chunks of
+    shift_unit (see reduce_normalize).
 
     Special-value results (NaN / Inf / all-zero) are unchanged from st_fdpa.
     The datapath width W is derived from the design: W = F + 1 +
-    ceil(log2(L + 1)) (32 for the default 32-term E4M3 F=25 block).
+    ceil(log2(L + 1)) (32 for the default 32-term E4M3 F=25 block); for
+    partial blocks (L < 32) the scan range is clamped to W - man_bits, since
+    the shifter cannot reach below the register's own width.
     """
     r = st_fdpa(a_bits, b_bits, c_bits, sfa_bits, sfb_bits, fmt=fmt, F=F,
                 overflow_to_inf=overflow_to_inf)
@@ -639,8 +654,9 @@ def st_fdpa_fast(
         return FdpaResult(0, 0.0, r.e_max, 0, r.aligned, "rnorm:zero")
     L = len(a_bits)
     W = F + 1 + (L + 1).bit_length()  # fixed register width of this datapath
+    T = min(total_shift_bits, W - man_bits)  # shifter range <= W - man_bits
     red = reduce_normalize(r.S, r.e_max - F, man_bits=man_bits,
-                           shift_unit=shift_unit, total_shift_bits=total_shift_bits,
+                           shift_unit=shift_unit, total_shift_bits=T,
                            W=W, fallback=fallback)
     bits = reduced_to_fp32_bits(red, overflow_to_inf=overflow_to_inf)
     return FdpaResult(bits, fp32_bits_to_float(bits), r.e_max, r.S, r.aligned,
@@ -831,7 +847,7 @@ def mxfp8_dot_fast(
     fmt: FpFormat = E4M3,
     F: int = 25,
     block: int = 32,
-    man_bits: int = 16,
+    man_bits: int = 24,
     shift_unit: int = 1,
     total_shift_bits: int = 8,
     fallback: str = "flush",
@@ -839,9 +855,9 @@ def mxfp8_dot_fast(
     """Chain fused dot products with the RNORM normalise between blocks.
 
     Identical structure to mxfp8_dot, but each block runs st_fdpa_fast, so the
-    c fed forward carries a man_bits-bit significand instead of FP32's 24.
-    Returns raw FP32 bits. NOT bit-accurate (except at man_bits = W -
-    total_shift_bits with shift_unit = 1, see test_rnorm_zero_precision_loss).
+    c fed forward carries a man_bits-bit significand (default 24: bit-identical
+    to mxfp8_dot; lower man_bits narrow the c datapath at the cost of
+    per-block truncation). Returns raw FP32 bits.
     """
     K = len(a_bits)
     if len(b_bits) != K:
@@ -1192,14 +1208,15 @@ def test_st_fdpa_n_rounding():
 
 
 def test_rnorm_reduce_normalize_units():
-    """The paths of the cheap normalise, by hand.
+    """The paths of the cheap normalise, by hand (man_bits=16 explicit here
+    to exercise the aggressive area point; the default is now 24).
 
-    Defaults W=32, man_bits=16, shift_unit=1, total_shift_bits=8: the scan
-    covers bits 31..24, the fixed miss window sits at bits 23..8, and values
-    with a leading one below bit 7 flush.
+    W=32, man_bits=16, shift_unit=1, total_shift_bits=8: the scan covers bits
+    31..24, the fixed miss window sits at bits 23..8, and values with a
+    leading one below bit 7 flush.
     """
     # HIT: S = 2**25 + 12345 (leading one at bit 25, inside bits 31..24).
-    r = reduce_normalize(2**25 + 12345, -25)
+    r = reduce_normalize(2**25 + 12345, -25, man_bits=16)
     assert r.note == "fast" and r.kept == 16
     assert r.m == ((2**25 + 12345) >> (25 - 15)) & 0xFFFF == ((2**25 + 12345) >> 10)
     assert r.m.bit_length() == 16  # explicit leading one at bit 15
@@ -1210,37 +1227,40 @@ def test_rnorm_reduce_normalize_units():
     assert abs(reduced_to_float(r) - (2**25 + 12345) * 2.0 ** -25) == 57 * 2.0 ** -25
 
     # MISS (cancellation): leading one at bit 20, below the scan.
-    r = reduce_normalize(2**20 + 7, -20)
+    r = reduce_normalize(2**20 + 7, -20, man_bits=16)
     assert r.note == "fallback" and r.m == 4096 and r.exp == 3  # 2**12, window top j=23
     assert reduced_to_float(r) == 1.0  # exact for the kept bits: 2**20 * 2**-20
 
     # FLUSH: leading one below the fixed window (p = 7 < bottom = 8).
-    r = reduce_normalize(2**7, -7)
+    r = reduce_normalize(2**7, -7, man_bits=16)
     assert r.note == "flush" and r.m == 0 and reduced_to_float(r) == 0.0
     # fallback="exact" pays a full CLZ instead and keeps the value
-    r = reduce_normalize(2**7 + 3, -7, fallback="exact")
+    r = reduce_normalize(2**7 + 3, -7, man_bits=16, fallback="exact")
     assert r.note == "exact" and r.m == (2**7 + 3) << (15 - 7)
     assert r.exp == 0 and reduced_to_float(r) == (2**7 + 3) * 2.0 ** -7
 
     # sign and zero handling; reduced pair feeds the next block as a Term
-    r = reduce_normalize(-(2**30), 0)
+    r = reduce_normalize(-(2**30), 0, man_bits=16)
     assert r.sign == -1 and r.note == "fast"
     t = reduced_to_term(r)
     assert t.kind == FINITE and t.sign == -1 and t.P == 15
-    t0 = reduced_to_term(reduce_normalize(-(2**7), -7))
+    t0 = reduced_to_term(reduce_normalize(-(2**7), -7, man_bits=16))
     assert t0.kind == ZERO and t0.sign == -1  # flushed zero keeps the sign
     # flush keeps the sign in the FP32 encode too (matches underflow-keeps-sign)
-    assert reduced_to_fp32_bits(reduce_normalize(-(2**7), -7)) == 0x80000000
+    assert reduced_to_fp32_bits(reduce_normalize(-(2**7), -7, man_bits=16)) == 0x80000000
 
     # W=None reference mode: exact exponent, reduced mantissa width, no flush
-    r = reduce_normalize(2**7 + 3, -7, W=None)
+    r = reduce_normalize(2**7 + 3, -7, man_bits=16, W=None)
     assert r.note == "exact" and r.exp == 0 and reduced_to_float(r) == (2**7 + 3) * 2.0 ** -7
     print("rnorm reduce_normalize       : hit / miss / flush / exact paths ok")
 
 
 def test_rnorm_block_paths():
-    """End-to-end: the miss path is exact, the flush is the one lossy corner,
-    and fallback='exact' removes it."""
+    """End-to-end (man_bits=16 explicit, the aggressive point where the
+    fixed-window miss and the flush corner are reachable): the miss path is
+    exact, the flush is the one lossy corner, and fallback='exact' removes
+    it. At the default man_bits=24 the miss window holds the whole value, so
+    neither case loses anything (see test_rnorm_zero_precision_loss)."""
     # Cancellation: products +24 (12*2) and -24 (8*-3) at e_max=4 cancel to
     # leave only 1*1 = 2**21 in accumulator units -> p=21, a MISS (with the
     # full 32-term datapath W=32 the scan covers bits 31..24), but the fixed
@@ -1248,7 +1268,7 @@ def test_rnorm_block_paths():
     a = encode_fp8_vector([12.0, 8.0, 1.0] + [0.0] * 29)
     b = encode_fp8_vector([2.0, -3.0, 1.0] + [0.0] * 29)
     exact = st_fdpa(a, b, 0, e8m0_bits(0), e8m0_bits(0))
-    fast = st_fdpa_fast(a, b, 0, e8m0_bits(0), e8m0_bits(0))
+    fast = st_fdpa_fast(a, b, 0, e8m0_bits(0), e8m0_bits(0), man_bits=16)
     assert exact.S == 1 << 21 and exact.e_max == 4, (exact.S, exact.e_max)
     assert fast.note == "rnorm:fallback"
     assert fast.bits == exact.bits and fast.value == 1.0  # miss kept everything
@@ -1261,18 +1281,20 @@ def test_rnorm_block_paths():
     exact5 = st_fdpa(a5, b5, 0, e8m0_bits(0), e8m0_bits(0), fmt=E5M2)
     assert exact5.S == 1 << 5 and exact5.e_max == 4, (exact5.S, exact5.e_max)
     assert exact5.value == 2.0 ** -16
-    flushed = st_fdpa_fast(a5, b5, 0, e8m0_bits(0), e8m0_bits(0), fmt=E5M2)
+    flushed = st_fdpa_fast(a5, b5, 0, e8m0_bits(0), e8m0_bits(0), fmt=E5M2,
+                           man_bits=16)
     assert flushed.note == "rnorm:flush" and flushed.value == 0.0
     kept = st_fdpa_fast(a5, b5, 0, e8m0_bits(0), e8m0_bits(0), fmt=E5M2,
-                        fallback="exact")
+                        man_bits=16, fallback="exact")
     assert kept.value == 2.0 ** -16 and kept.bits == exact5.bits
     print("rnorm block paths            : miss exact, flush lossy, exact-fallback restores")
 
 
 def test_rnorm_zero_precision_loss():
-    """The free operating point: man_bits = W - total_shift_bits (24 at
-    W=32, T=8) with shift_unit = 1 makes the cheap normalise bit-identical
-    to the reference model, always."""
+    """The default operating point IS the free point: man_bits = W -
+    total_shift_bits = 24 with shift_unit = 1 makes the cheap normalise
+    bit-identical to the reference model, always (single blocks and chained).
+    This is what st_fdpa_fast / mxfp8_dot_fast give with plain defaults."""
     import random as _r
 
     _r.seed(7)
@@ -1281,7 +1303,7 @@ def test_rnorm_zero_precision_loss():
         b = [_r.randrange(256) for _ in range(32)]
         sfa, sfb, c = _r.randrange(256), _r.randrange(256), _r.randrange(1 << 32)
         r1 = st_fdpa(a, b, c, sfa, sfb)
-        r2 = st_fdpa_fast(a, b, c, sfa, sfb, man_bits=24, total_shift_bits=8)
+        r2 = st_fdpa_fast(a, b, c, sfa, sfb)  # defaults: man_bits=24, T=8, g=1
         assert r1.bits == r2.bits, (r1.bits, r2.bits, r2.note)
     for _ in range(300):
         K = _r.choice([64, 128])
@@ -1290,9 +1312,18 @@ def test_rnorm_zero_precision_loss():
         b = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(K)]
         sfa = [_r.randrange(255) for _ in range(nb)]
         sfb = [_r.randrange(255) for _ in range(nb)]
-        assert mxfp8_dot(a, b, sfa, sfb) == mxfp8_dot_fast(
-            a, b, sfa, sfb, man_bits=24, total_shift_bits=8), (K,)
-    print("rnorm zero-precision-loss    : man_bits=24 == reference bit-for-bit")
+        assert mxfp8_dot(a, b, sfa, sfb) == mxfp8_dot_fast(a, b, sfa, sfb), (K,)
+    # partial (non-32) blocks must stay bit-identical too (T is clamped to
+    # the narrower datapath, which still covers the whole miss range)
+    _r.seed(29)
+    for _ in range(1000):
+        K = _r.randrange(1, 33)
+        a = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(K)]
+        b = [_r.randrange(0x7F) | (0x80 if _r.random() < 0.5 else 0) for _ in range(K)]
+        sfa, sfb, c = _r.randrange(256), _r.randrange(256), _r.randrange(1 << 32)
+        assert st_fdpa(a, b, c, sfa, sfb).bits == st_fdpa_fast(
+            a, b, c, sfa, sfb).bits, (K,)
+    print("rnorm zero-precision-loss    : defaults (man_bits=24) == reference")
 
 
 def test_rnorm_shift_grid():
