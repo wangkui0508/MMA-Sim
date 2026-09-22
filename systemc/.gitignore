@@ -1,2 +1,5 @@
 mxfp8_stfdpa_tb
 mxfp8_dump.txt*
+hopper_fp8_wgmma_tb
+hopper_fp8_coverage
+hopper_dump.txt*
